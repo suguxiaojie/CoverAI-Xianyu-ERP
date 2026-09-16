@@ -1,0 +1,659 @@
+package chat
+
+import (
+	"context"
+	"encoding/base64"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"xianyu-go/internal/db"
+)
+
+// TestRecordHistoryPageParsesDirectionMediaAndDeduplicates 封装TestRecordHistory页码ParsesDirectionMediaAndDeduplicates业务协调。
+func TestRecordHistoryPageParsesDirectionMediaAndDeduplicates(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// ctx 用于本次流程后续判断的ctx
+	ctx := context.Background()
+	// encoded 用于本次流程后续判断的encoded
+	encoded := func(value string) string { return base64.StdEncoding.EncodeToString([]byte(value)) }
+	// body 用于本次流程后续判断的请求体
+	body := map[string]any{
+		"hasMore": float64(1), "nextCursor": float64(12345),
+		"userMessageModels": []any{
+			map[string]any{"message": map[string]any{"messageId": "m2", "createAt": float64(2000), "extension": `{"senderUserId":"self@goofish","reminderTitle":"我"}`, "content": map[string]any{"custom": map[string]any{"data": encoded(`{"contentType":2,"image":{"pics":[{"url":"https://img.example/2.jpg"}]}}`)}}}},
+			map[string]any{"message": map[string]any{"messageId": "m1", "createAt": float64(1000), "extension": map[string]any{"senderUserId": "peer@goofish", "reminderTitle": "对方"}, "content": map[string]any{"custom": map[string]any{"data": encoded(`{"contentType":1,"text":{"text":"较早的消息"}}`)}}}},
+		},
+	}
+	// session 用于本次流程后续判断的会话
+	session := db.ChatSession{CookieID: "account-1", ChatID: "cid", BuyerID: "peer", BuyerName: "对方"}
+	// page、err 用于本次流程后续判断的page、err
+	page, err := service.RecordHistoryPage(ctx, "account-1", "cid", "self", session, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.HasMore || page.NextCursor != 12345 || len(page.Messages) != 2 {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	if page.Messages[0].Direction != "incoming" || page.Messages[0].Content != "较早的消息" {
+		t.Fatalf("unexpected incoming: %+v", page.Messages[0])
+	}
+	if page.Messages[1].Direction != "outgoing" || page.Messages[1].MessageType != "image" || page.Messages[1].Content != "https://img.example/2.jpg" {
+		t.Fatalf("unexpected outgoing image: %+v", page.Messages[1])
+	}
+	if // err 用于本次流程后续判断的err
+	_, err := service.RecordHistoryPage(ctx, "account-1", "cid", "self", session, body); err != nil {
+		t.Fatal(err)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(ctx, "owner")
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := store.Chats.ListMessages(ctx, owner.ID, "account-1", "cid", 0, 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("history retry inserted duplicates: %d", len(rows))
+	}
+	_, _, err = store.Chats.SaveMessage(ctx, session, db.ChatMessage{MessageKey: "system-later", Direction: "incoming", SenderID: "peer", SenderName: "快给ta一个评价吧～", MessageType: "text", Content: "快给ta一个评价吧～", Status: "received", SentAt: 3000}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// name、err 用于本次流程后续判断的name、err
+	name, err := store.Chats.LatestUnmaskedPeerName(ctx, "account-1", "cid")
+	if err != nil || name != "对方" {
+		t.Fatalf("historical nickname=%q err=%v", name, err)
+	}
+}
+
+// TestRecordHistoryPageReconcilesWrapperReadAndRecallState 验证历史模型顶层状态能够修复先到事件留下的旧消息。
+func TestRecordHistoryPageReconcilesWrapperReadAndRecallState(t *testing.T) {
+	// store、cleanup 保存隔离聊天存储及关闭函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 是执行历史规范化和单调状态合并的聊天服务。
+	service := New(store)
+	// ctx 是本测试所有数据库操作共享的生命周期。
+	ctx := context.Background()
+	// session 是跨平台出站消息所属的测试会话。
+	session := db.ChatSession{CookieID: "account-1", ChatID: "cross-platform", BuyerID: "peer", BuyerName: "追风kk"}
+	// stale 是事件到达前由旧历史保存的未读、未撤回出站消息。
+	stale := db.ChatMessage{MessageKey: "platform-recalled.PNM", PlatformMessageID: "platform-recalled.PNM", Direction: "outgoing", SenderID: "self", SenderName: "我", MessageType: "text", Content: "[系统消息]", Status: "sent", SentAt: 1000}
+	// inserted、saveErr 记录旧消息首次写入结果。
+	if _, inserted, saveErr := store.Chats.SaveMessage(ctx, session, stale, false); saveErr != nil || !inserted {
+		t.Fatalf("保存旧状态 inserted=%v err=%v", inserted, saveErr)
+	}
+	// body 模拟真实历史结构：状态位于 model 顶层，而正文位于 model.message。
+	body := map[string]any{"userMessageModels": []any{map[string]any{
+		"msgStatus": float64(2), "readStatus": float64(2), "modifyTime": float64(3000),
+		"recallFeature": map[string]any{"operatorType": float64(0), "operatorUid": "self@goofish", "showRecallStatusSetting": float64(1)},
+		"message": map[string]any{"messageId": "platform-recalled.PNM", "createAt": float64(1000),
+			"extension": map[string]any{"senderUserId": "self@goofish", "reminderTitle": "我"},
+			"content":   map[string]any{"contentType": float64(1), "custom": map[string]any{}},
+		},
+	}}}
+	// page、err 保存历史对账结果；返回页必须直接携带收敛后的状态。
+	page, err := service.RecordHistoryPage(ctx, "account-1", "cross-platform", "self", session, body)
+	if err != nil || len(page.Messages) != 1 {
+		t.Fatalf("历史对账 page=%+v err=%v", page, err)
+	}
+	// reconciled 是合并后的唯一消息，不得保留普通系统占位气泡状态。
+	reconciled := page.Messages[0]
+	if reconciled.Status != "recalled" || reconciled.ReadStatus != 2 || reconciled.ReadAt != 3000 || reconciled.RecalledAt != 3000 || reconciled.RecallOperatorType != 0 || reconciled.RecallOperatorID != "self@goofish" {
+		t.Fatalf("历史状态未收敛: %+v", reconciled)
+	}
+}
+
+// TestRecordHistoryPageClassifiesOfficialCardsAsSystem 封装TestRecordHistory页码ClassifiesOfficial卡密列表As系统业务协调。
+func TestRecordHistoryPageClassifiesOfficialCardsAsSystem(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// encoded 用于本次流程后续判断的encoded
+	encoded := base64.StdEncoding.EncodeToString([]byte(`{"contentType":26,"dxCard":{"item":{"main":{"targetUrl":"fleamarket://order_detail?id=order-26&itemId=item-26&role=seller","exContent":{"title":"我已拍下，待付款","desc":"请双方沟通及时确认价格","button":{"text":"修改价格","targetUrl":"fleamarket://adjust_price?flutter=true&bizOrderId=order-26"}}}}}}`))
+	// body 用于本次流程后续判断的请求体
+	body := map[string]any{"userMessageModels": []any{
+		map[string]any{"message": map[string]any{
+			"messageId": "official-card", "createAt": float64(3000),
+			"extension": map[string]any{"senderUserId": "peer@goofish", "reminderTitle": "买家已拍下，待付款"},
+			"content":   map[string]any{"custom": map[string]any{"data": encoded, "summary": "[我已拍下，待付款]"}},
+		}},
+	}}
+	// session 用于本次流程后续判断的会话
+	session := db.ChatSession{CookieID: "account-1", ChatID: "official", BuyerID: "peer", BuyerName: "真实昵称"}
+	if // err 用于本次流程后续判断的err
+	_, _, err := store.Chats.SaveMessage(context.Background(), session, db.ChatMessage{
+		MessageKey: "official-card", Direction: "incoming", SenderID: "peer", SenderName: "真实昵称",
+		MessageType: "text", Content: "[我已拍下，待付款]", Status: "received", SentAt: 3000,
+		PlatformContentType: 26, SystemCardKind: "trade", SystemCardEvent: "unknown_trade_event",
+	}, false); err != nil {
+		t.Fatal(err)
+	}
+	// page、err 用于本次流程后续判断的page、err
+	page, err := service.RecordHistoryPage(context.Background(), "account-1", "official", "self", session, body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Messages) != 1 || page.Messages[0].MessageType != "system" || page.Messages[0].Direction != "incoming" {
+		t.Fatalf("official card was not classified as system: %+v", page.Messages)
+	}
+	if page.Messages[0].SenderName != "真实昵称" {
+		t.Fatalf("history sender metadata unexpectedly changed: %+v", page.Messages[0])
+	}
+	// card 是历史刷新补齐到重复消息上的结构化交易卡片。
+	card := page.Messages[0]
+	if card.PlatformContentType != 26 || card.SystemCardKind != "trade" || card.SystemCardEvent != "order_pending_payment" ||
+		card.SystemCardTitle != "我已拍下，待付款" || card.SystemCardDescription != "请双方沟通及时确认价格" ||
+		card.SystemCardOrderID != "order-26" || card.SystemCardItemID != "item-26" || card.SystemCardAction != "adjust_price" {
+		t.Fatalf("历史交易卡片未结构化并补齐重复消息: %+v", card)
+	}
+}
+
+// TestRecordIncomingStructuresOfficialTradeCard 验证实时 contentType=26 与历史使用同一结构化卡片解析链。
+func TestRecordIncomingStructuresOfficialTradeCard(t *testing.T) {
+	// store、cleanup 保存隔离数据库和关闭函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 是待验证实时消息落库和发布前结构化的聊天服务。
+	service := New(store)
+	// raw 是实时 WS 解密后携带 JSON 字符串卡片正文的最小夹具。
+	raw := map[string]any{
+		"messageId": "live-trade-card.PNM",
+		"content":   `{"contentType":26,"dxCard":{"item":{"main":{"exContent":{"title":"我已付款，等待你发货","desc":"请及时处理订单"},"targetUrl":"fleamarket://order_detail?id=paid-order&itemId=paid-item&role=seller"}}}}`,
+	}
+	// message、inserted、recordErr 保存实时卡片落库结果。
+	message, inserted, recordErr := service.RecordIncoming(context.Background(), Incoming{
+		AccountID: "account-1", ChatID: "live-trade", BuyerID: "peer", BuyerName: "买家", Text: "[我已付款，等待你发货]", Raw: raw,
+	})
+	if recordErr != nil || !inserted {
+		t.Fatalf("实时交易卡片落库失败: inserted=%v err=%v", inserted, recordErr)
+	}
+	if message.MessageType != "system" || message.Content != "我已付款，等待你发货" || message.PlatformContentType != 26 ||
+		message.SystemCardEvent != "order_paid" || message.SystemCardOrderID != "paid-order" || message.SystemCardItemID != "paid-item" || message.SystemCardAction != "ship_order" {
+		t.Fatalf("实时交易卡片未结构化: %+v", message)
+	}
+}
+
+// TestRecordIncomingClassifiesXianxiaomiAndPlaceholder 封装TestRecordIncomingClassifiesXianxiaomiAndPlaceholder业务协调。
+func TestRecordIncomingClassifiesXianxiaomiAndPlaceholder(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// message、inserted、err 用于本次流程后续判断的message、inserted、err
+	message, inserted, err := service.RecordIncoming(context.Background(), Incoming{
+		AccountID: "account-1", ChatID: "xiaomi", BuyerID: "1400@goofish",
+		BuyerName: "闲小蜜发来一条新消息", Text: "邀您填写售后问卷",
+		Raw: map[string]any{"messageId": "xiaomi-1"},
+	})
+	if err != nil || !inserted {
+		t.Fatalf("record xianxiaomi message: message=%+v inserted=%v err=%v", message, inserted, err)
+	}
+	if message.MessageType != "system" || message.SenderName != "闲小蜜" {
+		t.Fatalf("xianxiaomi message was not classified: %+v", message)
+	}
+}
+
+// TestRecordIncomingExtractsMessageIDFromEncodedExtension 验证嵌套扩展中的平台消息键优先进入实时落库。
+func TestRecordIncomingExtractsMessageIDFromEncodedExtension(t *testing.T) {
+	// store、cleanup 保存隔离聊天数据库及清理函数，确保消息键提取不依赖其他用例数据。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 是待测聊天服务，使用上述存储验证实时消息落库。
+	service := New(store)
+	// message、err 保存落库后的消息和处理错误，消息键必须来自编码扩展字段。
+	message, _, err := service.RecordIncoming(context.Background(), Incoming{
+		AccountID: "account-1", ChatID: "live", BuyerID: "peer", BuyerName: "对方", Text: "实时消息",
+		Raw: map[string]any{"1": map[string]any{"10": map[string]any{
+			"extJson": `{"messageId":"live-123"}`,
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if message.MessageKey != "live-123" {
+		t.Fatalf("实时消息未提取平台 messageId: %+v", message)
+	}
+}
+
+// TestRecordConversationPageImportsHistoricalContacts 验证联系人历史页不会覆盖较新的会话摘要。
+func TestRecordConversationPageImportsHistoricalContacts(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// encoded 用于本次流程后续判断的encoded
+	encoded := base64.StdEncoding.EncodeToString([]byte(`{"contentType":1,"text":{"text":"历史消息"}}`))
+	if // err 用于本次流程后续判断的err
+	err := store.Chats.UpsertSession(context.Background(), db.ChatSession{CookieID: "account-1", ChatID: "history-cid", BuyerID: "peer-9", LastMessage: "错误的新摘要", LastMessageAt: 987654}); err != nil {
+		t.Fatal(err)
+	}
+	// body 用于本次流程后续判断的请求体
+	body := map[string]any{"hasMore": true, "nextCursor": float64(888), "userConvs": []any{
+		map[string]any{"singleChatUserConversation": map[string]any{
+			"singleChatConversation": map[string]any{"cid": "history-cid@goofish", "pairFirst": "self@goofish", "pairSecond": "peer-9@goofish", "extension": `{"itemTitle":"旧商品"}`},
+			"lastMessage":            map[string]any{"message": map[string]any{"createAt": float64(123456), "extension": map[string]any{"senderUserId": "peer-9@goofish", "reminderTitle": "历史用户"}, "content": map[string]any{"custom": map[string]any{"data": encoded}}}},
+			"modifyTime":             float64(987654), "redPoint": float64(2),
+		}},
+	}}
+	// page、err 用于本次流程后续判断的page、err
+	page, err := service.RecordConversationPage(context.Background(), "account-1", "self", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !page.HasMore || page.NextCursor != 888 {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(context.Background(), "owner")
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := store.Chats.ListSessions(context.Background(), owner.ID, "account-1", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BuyerID != "peer-9" || rows[0].BuyerName != "" || rows[0].LastMessage != "历史消息" || rows[0].UnreadCount != 2 {
+		t.Fatalf("unexpected historical contact: %+v", rows)
+	}
+	if rows[0].LastMessageAt != 123456 {
+		t.Fatalf("used conversation modifyTime instead of last message createAt: %d", rows[0].LastMessageAt)
+	}
+}
+
+// TestRecordConversationPageHandlesXianxiaomiAndRemovesInvisibleSessions 封装TestRecordConversation页码HandlesXianxiaomiAndRemovesInvisibleSessions业务协调。
+func TestRecordConversationPageHandlesXianxiaomiAndRemovesInvisibleSessions(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 用于本次流程后续判断的ctx
+	ctx := context.Background()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	if // err 用于本次流程后续判断的err
+	err := store.Chats.UpsertSession(ctx, db.ChatSession{CookieID: "account-1", ChatID: "hidden", BuyerID: "peer", LastMessage: "暂无消息"}); err != nil {
+		t.Fatal(err)
+	}
+	if // err 用于本次流程后续判断的err
+	err := store.Chats.UpsertSession(ctx, db.ChatSession{CookieID: "account-1", ChatID: "platform", BuyerID: "900", LastMessage: "暂无消息"}); err != nil {
+		t.Fatal(err)
+	}
+	// body 用于本次流程后续判断的请求体
+	body := map[string]any{"userConvs": []any{
+		map[string]any{"singleChatUserConversation": map[string]any{"visible": float64(0), "singleChatConversation": map[string]any{"cid": "hidden@goofish"}}},
+		map[string]any{"singleChatUserConversation": map[string]any{"visible": float64(1), "singleChatConversation": map[string]any{"cid": "platform@goofish", "pairFirst": "self@goofish", "pairSecond": "0@goofish", "extension": map[string]any{"extUserId": "900"}}}},
+		map[string]any{"singleChatUserConversation": map[string]any{"visible": float64(1), "modifyTime": float64(123),
+			"singleChatConversation": map[string]any{"cid": "xiaomi@goofish", "pairFirst": "self@goofish", "pairSecond": "0@goofish", "extension": map[string]any{"extUserId": "1400"}},
+			"redPoint":               float64(3),
+			"lastMessage":            map[string]any{"message": map[string]any{"extension": map[string]any{"senderUserId": "1400@goofish", "reminderTitle": "闲小蜜发来一条新消息"}, "content": map[string]any{"custom": map[string]any{"summary": "邀您填写售后问卷"}}}}}},
+	}}
+	if // err 用于本次流程后续判断的err
+	_, err := service.RecordConversationPage(ctx, "account-1", "self", body); err != nil {
+		t.Fatal(err)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(ctx, "owner")
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := store.Chats.ListSessions(ctx, owner.ID, "account-1", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].BuyerID != "1400" || rows[0].BuyerName != "闲小蜜" || rows[0].BuyerAvatar != xianxiaomiAvatar || rows[0].UnreadCount != 0 {
+		t.Fatalf("unexpected sessions: %+v", rows)
+	}
+}
+
+// TestConversationUnreadCountUsesRedPointButFiltersSystemMessages 验证官方红点不会把系统卡片计为用户未读。
+func TestConversationUnreadCountUsesRedPointButFiltersSystemMessages(t *testing.T) {
+	// store、cleanup 保存隔离聊天数据库及清理函数，供红点与本地未读数交叉验证。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 是待测聊天服务，负责按系统消息规则折算会话红点。
+	service := New(store)
+
+	// systemCard 保存模拟交易通知的 Base64 卡片载荷，使末条消息被归类为系统消息。
+	systemCard := base64.StdEncoding.EncodeToString([]byte(`{"contentType":26}`))
+	// systemLast 保存带官方红点和系统未读状态的末条消息协议对象。
+	systemLast := map[string]any{
+		"extension":   map[string]any{"senderUserId": "peer@goofish"},
+		"content":     map[string]any{"custom": map[string]any{"summary": "[交易通知]", "data": systemCard}},
+		"unreadCount": float64(1), "readStatus": float64(1),
+	}
+	// got 保存扣除系统消息后的用户未读数，系统部分不得显示为用户红点。
+	if got := service.conversationUnreadCount(context.Background(), "account-1", "system-last", "peer", map[string]any{"redPoint": float64(3)}, systemLast, "[交易通知]", 0); got != 2 {
+		t.Fatalf("系统未读未从 redPoint 扣除: got=%d", got)
+	}
+	// got 保存闲小蜜会话的折算未读数；该官方系统账号永远不产生用户红点。
+	if got := service.conversationUnreadCount(context.Background(), "account-1", "xiaomi", "1400", map[string]any{"redPoint": float64(3)}, systemLast, "[交易通知]", 0); got != 0 {
+		t.Fatalf("闲小蜜全是系统消息时仍显示红点: got=%d", got)
+	}
+
+	// err 保存真实用户消息持久化错误；成功后本地消息级未读数应优先于官方红点。
+	if _, _, err := service.RecordIncoming(context.Background(), Incoming{
+		AccountID: "account-1", ChatID: "real", BuyerID: "peer", BuyerName: "真实用户", Text: "未读消息",
+		MessageID: "real-unread", Raw: map[string]any{"messageId": "real-unread"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// userLast 保存真实用户末条消息协议对象，不含系统卡片字段。
+	userLast := map[string]any{
+		"extension": map[string]any{"senderUserId": "peer@goofish"},
+		"content":   map[string]any{"custom": map[string]any{"summary": "未读消息"}},
+	}
+	// got 保存本地记录的真实用户未读数，必须防止较慢官方刷新复活已读红点。
+	if got := service.conversationUnreadCount(context.Background(), "account-1", "real", "peer", map[string]any{"redPoint": float64(3)}, userLast, "未读消息", 0); got != 1 {
+		t.Fatalf("未使用消息级真实未读数: got=%d", got)
+	}
+}
+
+// TestConversationUnreadCountKeepsReadLocalLatestAtZero 验证平台旧红点不能复活本地已读的同一条最新消息。
+func TestConversationUnreadCountKeepsReadLocalLatestAtZero(t *testing.T) {
+	// store、cleanup 保存隔离聊天数据库及清理函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 是测试消息保存和摘要归一化共享的上下文。
+	ctx := context.Background()
+	// session 是已存在的测试会话摘要。
+	session := db.ChatSession{CookieID: "account-1", ChatID: "read-system", BuyerID: "peer"}
+	// message 是已读的最新系统卡片，模拟用户已经多次打开会话。
+	message := db.ChatMessage{MessageKey: "system-read.PNM", Direction: "incoming", MessageType: "system", Content: "可以送我闲鱼小红花吗~", ReadStatus: 2, ReadAt: 1001, SentAt: 1000}
+	if // saveErr 是已读系统消息测试夹具保存错误。
+	_, _, saveErr := store.Chats.SaveMessage(ctx, session, message, false); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	// service 是使用真实窄仓储读取本地最新已读状态的聊天服务。
+	service := New(store)
+	// got 是平台仍返回旧 redPoint=1 时最终用于会话列表的未读数。
+	got := service.conversationUnreadCount(ctx, "account-1", "read-system", "peer", map[string]any{"redPoint": float64(1)}, map[string]any{}, "可以送我闲鱼小红花吗~", 1000)
+	if got != 0 {
+		t.Fatalf("已读本地最新消息不应被平台旧红点复活: got=%d", got)
+	}
+}
+
+// TestConversationUnreadCountDropsStaleRedPointForReadFlowerSummary 验证平台缺失卡片载荷时，已读小红花稳定摘要不会复活会话红点。
+func TestConversationUnreadCountDropsStaleRedPointForReadFlowerSummary(t *testing.T) {
+	// store、cleanup 保存隔离聊天数据库和清理函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 是保存已读小红花系统消息和计算红点的共享上下文。
+	ctx := context.Background()
+	// session 是实测红点残留对应的普通买家会话。
+	session := db.ChatSession{CookieID: "account-1", ChatID: "read-flower", BuyerID: "peer"}
+	// message 是本地已确认已读的求花系统卡片。
+	message := db.ChatMessage{MessageKey: "flower-read.PNM", Direction: "incoming", MessageType: "system", Content: "可以送我闲鱼小红花吗~", ReadStatus: 2, ReadAt: 1001, SentAt: 1000}
+	if // saveErr 是已读求花系统消息的持久化错误。
+	_, _, saveErr := store.Chats.SaveMessage(ctx, session, message, false); saveErr != nil {
+		t.Fatal(saveErr)
+	}
+	// service 是使用真实本地已读状态抑制平台旧红点的聊天服务。
+	service := New(store)
+	// got 是联系人摘要只剩“已求买家送我闲鱼小红花”且平台仍返回 redPoint=1 时的最终用户未读数。
+	got := service.conversationUnreadCount(ctx, "account-1", "read-flower", "peer", map[string]any{"redPoint": float64(1)}, map[string]any{"readStatus": float64(2)}, "已求买家送我闲鱼小红花", 1248)
+	if got != 0 {
+		t.Fatalf("已读小红花摘要不应复活红点: got=%d", got)
+	}
+}
+
+// TestHistoryMessageIsSystem 验证历史卡片载荷和普通用户文本被正确区分，避免误算未读。
+func TestHistoryMessageIsSystem(t *testing.T) {
+	// encoded 保存模拟交易卡片的 Base64 载荷，触发内容类型的系统消息识别。
+	encoded := base64.StdEncoding.EncodeToString([]byte(`{"contentType":26,"dxCard":{}}`))
+	// last 保存待识别的历史末条消息协议对象。
+	last := map[string]any{
+		"extension": map[string]any{"senderUserId": "peer@goofish"},
+		"content":   map[string]any{"custom": map[string]any{"data": encoded}},
+	}
+	if !historyMessageIsSystem(last, "[我已拍下，待付款]") {
+		t.Fatal("交易卡片应被识别为系统消息")
+	}
+	if historyMessageIsSystem(map[string]any{
+		"extension": map[string]any{"senderUserId": "peer@goofish"},
+		"content":   map[string]any{"custom": map[string]any{"summary": "你好"}},
+	}, "你好") {
+		t.Fatal("真实用户文本不应被识别为系统消息")
+	}
+}
+
+// TestRecordConversationPageSkipsEmptyConversationShells 验证空会话壳不会被错误展示为联系人。
+func TestRecordConversationPageSkipsEmptyConversationShells(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// body 用于本次流程后续判断的请求体
+	body := map[string]any{"userConvs": []any{
+		map[string]any{"singleChatUserConversation": map[string]any{
+			"singleChatConversation": map[string]any{"cid": "empty@goofish", "pairFirst": "self@goofish", "pairSecond": "69@goofish"},
+		}},
+		map[string]any{"singleChatUserConversation": map[string]any{
+			"singleChatConversation": map[string]any{"cid": "system@goofish", "pairFirst": "self@goofish", "pairSecond": "1400@goofish"},
+			"lastMessage": map[string]any{"message": map[string]any{
+				"createAt": float64(100), "reminderContent": "邀您填写售后问卷",
+			}},
+		}},
+	}}
+	if // err 用于本次流程后续判断的err
+	_, err := service.RecordConversationPage(context.Background(), "account-1", "self", body); err != nil {
+		t.Fatal(err)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(context.Background(), "owner")
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := store.Chats.ListSessions(context.Background(), owner.ID, "account-1", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ChatID != "system" {
+		t.Fatalf("empty conversation shell was imported: %+v", rows)
+	}
+}
+
+// TestDeleteEmptySessionsRemovesGhostsButKeepsRealConversation 封装TestDeleteEmptySessionsRemovesGhostsButKeepsRealConversation业务协调。
+func TestDeleteEmptySessionsRemovesGhostsButKeepsRealConversation(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 用于本次流程后续判断的ctx
+	ctx := context.Background()
+	// ghost 用于本次流程后续判断的ghost
+	ghost := db.ChatSession{CookieID: "account-1", ChatID: "ghost", BuyerID: "peer-ghost", LastMessage: "暂无消息", LastMessageAt: 100}
+	if // err 用于本次流程后续判断的err
+	err := store.Chats.UpsertSession(ctx, ghost); err != nil {
+		t.Fatal(err)
+	}
+	// real 用于本次流程后续判断的real
+	real := db.ChatSession{CookieID: "account-1", ChatID: "real", BuyerID: "peer-real", LastMessage: "暂无消息", LastMessageAt: 200}
+	if // err 用于本次流程后续判断的err
+	_, _, err := store.Chats.SaveMessage(ctx, real, db.ChatMessage{MessageKey: "real-1", Direction: "incoming", SenderID: "peer-real", SenderName: "真实用户", MessageType: "text", Content: "真实消息", Status: "received", SentAt: 200}, false); err != nil {
+		t.Fatal(err)
+	}
+	if // err 用于本次流程后续判断的err
+	err := store.Chats.DeleteEmptySessions(ctx, "account-1"); err != nil {
+		t.Fatal(err)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(ctx, "owner")
+	// rows、err 用于本次流程后续判断的rows、err
+	rows, err := store.Chats.ListSessions(ctx, owner.ID, "account-1", 20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ChatID != "real" {
+		t.Fatalf("unexpected sessions after pruning: %+v", rows)
+	}
+}
+
+// TestValidNicknameRejectsSystemReminderTitles 封装Test有效NicknameRejects系统ReminderTitles业务协调。
+func TestValidNicknameRejectsSystemReminderTitles(t *testing.T) {
+	// value 表示当前遍历过程中的值
+	for _, value := range []string{"", "203591535", "x***3", "快给ta一个评价吧～", "[卖家已发货]", "闲小蜜发来一条新消息"} {
+		if ValidNickname(value) {
+			t.Fatalf("system reminder accepted as nickname: %q", value)
+		}
+	}
+	if !ValidNickname("纽约做手工的石斑") {
+		t.Fatal("real nickname rejected")
+	}
+}
+
+// TestIncomingMessagePersistsDeduplicatesAndPublishesByOwner 封装TestIncoming消息PersistsDeduplicatesAndPublishesBy所有者业务协调。
+func TestIncomingMessagePersistsDeduplicatesAndPublishesByOwner(t *testing.T) {
+	// store、cleanup 用于本次流程后续判断的store、cleanup
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 用于本次流程后续判断的ctx
+	ctx := context.Background()
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(ctx, "owner")
+	// other 用于本次流程后续判断的other
+	other, _ := store.Users.GetByUsername(ctx, "other")
+	// service 用于本次流程后续判断的service
+	service := New(store)
+	// ownerEvents、cancelOwner、err 用于本次流程后续判断的所有者Events、cancelOwner、err
+	ownerEvents, cancelOwner, err := service.Subscribe(ctx, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelOwner()
+	// otherEvents、cancelOther、err 用于本次流程后续判断的otherEvents、cancelOther、err
+	otherEvents, cancelOther, err := service.Subscribe(ctx, other.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cancelOther()
+
+	// incoming 用于本次流程后续判断的incoming
+	incoming := Incoming{AccountID: "account-1", ChatID: "chat-1", BuyerID: "buyer-1", BuyerName: "买家甲",
+		Text: "你好", ItemID: "item-1", Raw: map[string]any{"messageId": "platform-1", "sendTime": int64(1234567890000)}}
+	// message、inserted、err 用于本次流程后续判断的message、inserted、err
+	message, inserted, err := service.RecordIncoming(ctx, incoming)
+	if err != nil || !inserted || message.MessageKey != "platform-1" {
+		t.Fatalf("message=%+v inserted=%v err=%v", message, inserted, err)
+	}
+	if // inserted、err 用于本次流程后续判断的inserted、err
+	_, inserted, err := service.RecordIncoming(ctx, incoming); err != nil || inserted {
+		t.Fatalf("duplicate inserted=%v err=%v", inserted, err)
+	}
+	select {
+	case // event 用于本次流程后续判断的event
+	event := <-ownerEvents:
+		if event.Type != "message.created" || event.Message.MessageKey != "platform-1" {
+			t.Fatalf("event=%+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("owner did not receive event")
+	}
+	select {
+	case // event 用于本次流程后续判断的event
+	event := <-otherEvents:
+		t.Fatalf("other owner leaked event: %+v", event)
+	case <-time.After(30 * time.Millisecond):
+	}
+}
+
+// TestRecordOutgoingMediaSentPublishesAndDeduplicatesPlatformEcho 验证自动化图片立即广播且后续同 PNM 回显不产生第二行。
+func TestRecordOutgoingMediaSentPublishesAndDeduplicatesPlatformEcho(t *testing.T) {
+	// store、cleanup 分别是隔离聊天存储和资源释放函数。
+	store, cleanup := chatTestStore(t)
+	defer cleanup()
+	// ctx 是图片旁路保存、订阅和回显合并共用的测试上下文。
+	ctx := context.Background()
+	// owner 是 account-1 所属用户，用于验证事件只广播给有权订阅者。
+	owner, _ := store.Users.GetByUsername(ctx, "owner")
+	// service 是同时负责图片持久化和实时广播的聊天服务。
+	service := New(store)
+	// ownerEvents、cancelOwner、subscribeErr 分别是所有者事件流、清理函数和订阅错误。
+	ownerEvents, cancelOwner, subscribeErr := service.Subscribe(ctx, owner.ID)
+	if subscribeErr != nil {
+		t.Fatalf("订阅图片聊天事件失败: %v", subscribeErr)
+	}
+	defer cancelOwner()
+	// session 是自动化图片所属的真实账号、会话和买家摘要。
+	session := db.ChatSession{CookieID: "account-1", ChatID: "chat-image", BuyerID: "buyer-1"}
+	// saved、saveErr 分别是平台确认图片写入后的本地消息和持久化错误。
+	saved, saveErr := service.RecordOutgoingMediaSent(ctx, session, "", "image-1.PNM", "image", "https://cdn.example/card.png", 2000)
+	if saveErr != nil || saved.MessageKey != "image-1.PNM" || saved.PlatformMessageID != "image-1.PNM" || saved.MessageType != "image" || saved.Status != "sent" {
+		t.Fatalf("自动化图片保存异常 message=%+v err=%v", saved, saveErr)
+	}
+	select {
+	case // event 是所有者订阅立即收到的自动化图片创建事件。
+	event := <-ownerEvents:
+		if event.Type != "message.created" || event.Message == nil || event.Message.MessageKey != "image-1.PNM" {
+			t.Fatalf("自动化图片未即时广播: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("等待自动化图片实时广播超时")
+	}
+	// echoed、inserted、echoErr 分别是后续平台历史回显合并结果、首次插入标记和错误。
+	echoed, inserted, echoErr := store.Chats.SaveMessage(ctx, session, db.ChatMessage{MessageKey: "image-1.PNM", PlatformMessageID: "image-1.PNM", Direction: "outgoing", SenderID: "account-1", MessageType: "image", Content: "https://cdn.example/card.png", Status: "sent", SentAt: 2000}, false)
+	if echoErr != nil || inserted || echoed.ID != saved.ID {
+		t.Fatalf("同 PNM 历史回显应合并原图片 message=%+v inserted=%t err=%v", echoed, inserted, echoErr)
+	}
+	// count 是同平台图片标识对应的最终消息行数。
+	var count int
+	// countErr 是统计同 PNM 图片消息数量的数据库错误。
+	countErr := store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM chat_messages WHERE cookie_id=? AND platform_message_id=?`, "account-1", "image-1.PNM").Scan(&count)
+	if countErr != nil || count != 1 {
+		t.Fatalf("自动化图片历史回显产生重复行 count=%d err=%v", count, countErr)
+	}
+}
+
+// TestExtractMessageContentSupportsImageAndVideo 封装TestExtract消息内容Supports图片AndVideo业务协调。
+func TestExtractMessageContentSupportsImageAndVideo(t *testing.T) {
+	// imageRaw 用于本次流程后续判断的图片原始
+	imageRaw := map[string]any{"payload": `{"contentType":2,"image":{"pics":[{"url":"https://cdn/image.jpg"}]}}`}
+	if // kind、content 用于本次流程后续判断的kind、content
+	kind, content := extractMessageContent(imageRaw, "[图片]"); kind != "image" || content != "https://cdn/image.jpg" {
+		t.Fatalf("image kind=%q content=%q", kind, content)
+	}
+	// videoRaw 用于本次流程后续判断的video原始
+	videoRaw := map[string]any{"content": map[string]any{"video": map[string]any{"playUrl": "https://cdn/video.mp4"}}}
+	if // kind、content 用于本次流程后续判断的kind、content
+	kind, content := extractMessageContent(videoRaw, "[视频]"); kind != "video" || content != "https://cdn/video.mp4" {
+		t.Fatalf("video kind=%q content=%q", kind, content)
+	}
+	if // kind、content 用于本次流程后续判断的kind、content
+	kind, content := extractMessageContent(nil, " 你好 "); kind != "text" || content != "你好" {
+		t.Fatalf("text kind=%q content=%q", kind, content)
+	}
+}
+
+// chatTestStore 封装聊天TestStore业务协调。
+func chatTestStore(t *testing.T) (*db.Store, func()) {
+	t.Helper()
+	// database、dialect、err 用于本次流程后续判断的database、dialect、err
+	database, dialect, err := db.Open(context.Background(), filepath.Join(t.TempDir(), "chat.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// store 用于本次流程后续判断的store
+	store := db.NewStore(database, dialect)
+	if // ok、err 用于本次流程后续判断的ok、err
+	ok, err := store.Users.Create(context.Background(), "owner", "owner@example.com", "pw"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	if // ok、err 用于本次流程后续判断的ok、err
+	ok, err := store.Users.Create(context.Background(), "other", "other@example.com", "pw"); err != nil || !ok {
+		t.Fatal(err)
+	}
+	// owner 用于本次流程后续判断的所有者
+	owner, _ := store.Users.GetByUsername(context.Background(), "owner")
+	// other 用于本次流程后续判断的other
+	other, _ := store.Users.GetByUsername(context.Background(), "other")
+	if // err 用于本次流程后续判断的err
+	err := store.Cookies.Save(context.Background(), "account-1", "unb=1", owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if // err 用于本次流程后续判断的err
+	err := store.Cookies.Save(context.Background(), "account-2", "unb=2", other.ID); err != nil {
+		t.Fatal(err)
+	}
+	return store, func() { _ = database.Close() }
+}

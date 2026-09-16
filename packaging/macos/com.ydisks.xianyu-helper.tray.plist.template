@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.ydisks.xianyu-helper.tray</string>
+	<key>ProgramArguments</key><array><string>__TRAY__</string><string>--background</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>StandardOutPath</key><string>__LOG_DIR__/tray.log</string>
+	<key>StandardErrorPath</key><string>__LOG_DIR__/tray.log</string>
+	<!-- 原生壳登录时只启动菜单栏；用户显式打开 App 后再显示 WKWebView 主窗口。 -->
+	<key>KeepAlive</key><false/>
+</dict>
+</plist>

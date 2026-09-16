@@ -1,0 +1,219 @@
+import type { PublishLocation } from '../../../shared/api-contract/items';
+import {
+AccountDetail,
+BatchCancelResponse,
+BatchIDResponse,
+CategoryRecommendationResponse,
+Item,
+ItemDetailResponse,
+ItemPublishBatchPreviewResponse,
+ItemPublishBatchResponse,
+ItemPublishResponse,ItemSyncResponse,
+OperationResponse,
+ShippingRule
+} from '../../../shared/api-contract/items';
+import { ApiError,del,get,post,postForm,put,type RequestControlOptions } from '../../../shared/http/client';
+import { collectionFrom } from '../../../shared/http/contract';
+export type * from '../../../shared/api-contract/items';
+import { getPublishLocations as queryPublishLocations,type PublishLocationRequestOptions } from './amapLocation';
+
+/** 商品账号筛选器读取非敏感账号摘要。 */
+export const getAccountDetails = async (options?: RequestControlOptions): Promise<AccountDetail[]> => get('/api/v1/accounts/details', undefined, options);
+
+/** 商品页面读取自动化发货规则的兼容列表。 */
+export const getShippingRules = async (options?: RequestControlOptions): Promise<ShippingRule[]> => get('/api/v1/automation-rules', undefined, options);
+
+// getPublishLocations 通过 feature API 边界读取地点，并把取消/超时控制传入地图服务。
+export const getPublishLocations = (longitude: number, latitude: number, options?: PublishLocationRequestOptions): Promise<PublishLocation[]> => queryPublishLocations(longitude, latitude, options);
+export type { PublishLocation } from '../../../shared/api-contract/items';
+
+// itemErrorMessage 将统一 HTTP 错误码归一为商品 feature 可执行的用户提示。
+export const itemErrorMessage = (error: unknown, fallback: string): string => {
+  if (error instanceof ApiError) {
+    switch (error.code) {
+      case 'stock_permission_missing':
+        return '发布失败：该账号没有库存发布权限，无法按库存数量发布商品。请换账号或先在闲鱼确认库存能力。';
+      case 'conflict':
+      case 'item_conflict':
+        return '商品状态已发生变化，请刷新后重试。';
+      case 'external_result_unknown':
+      case 'manual_review_required':
+        return '平台结果暂时无法确认，请先人工核对闲鱼状态，再决定是否重试。';
+      case 'retryable':
+      case 'temporarily_unavailable':
+        return '平台暂时不可用，请稍后重试。';
+      default:
+        return error.message || fallback;
+    }
+  }
+  if (error instanceof Error) return error.message;
+  // message 保存兼容 API 错误对象中的文本说明。
+  const message = typeof error === 'object' && error !== null && 'message' in error ? (error as { /** message 是兼容错误对象中的文本说明。 */ message?: unknown }).message : undefined;
+  return typeof message === 'string' ? message : fallback;
+};
+// Items
+// normalizeBooleanFlag 归一化布尔标记。
+const normalizeBooleanFlag = (value: unknown): boolean =>
+    value === true || value === 1 || value === '1';
+
+// getItems 读取商品列表。
+export const getItems = async (cookieId?: string, options?: RequestControlOptions): Promise<Item[]> => {
+    // res 接口响应结果，用于当前 API 处理流程。
+    const res = await get<unknown>('/api/v1/items', cookieId ? { cookie_id: cookieId } : undefined, options);
+    // items 商品列表，用于当前 API 处理流程。
+    const items = collectionFrom<Item>(res, ['items', 'data', 'results']);
+    return items.map(/* 当前回调用于处理集合元素或接口响应。 */ (item: any) => ({
+      ...item,
+      id: item.id || `${item.cookie_id}-${item.item_id}`,
+      is_multi_spec: normalizeBooleanFlag(item.is_multi_spec),
+      is_multi_qty_ship: normalizeBooleanFlag(item.is_multi_qty_ship ?? item.multi_quantity_delivery),
+      multi_quantity_delivery: normalizeBooleanFlag(item.multi_quantity_delivery ?? item.is_multi_qty_ship),
+      skus: Array.isArray(item.skus) ? item.skus.map(/* skuNormalizer 保留字符串标识并归一平台布尔字段和可空成本。 */ (sku: any) => ({
+        ...sku,
+        sku_id: String(sku.sku_id || ''),
+        inventory_id: String(sku.inventory_id || ''),
+        enabled: normalizeBooleanFlag(sku.enabled),
+        cost_cents: typeof sku.cost_cents === 'number' ? sku.cost_cents : null,
+        local_only: normalizeBooleanFlag(sku.local_only),
+        properties: Array.isArray(sku.properties) ? sku.properties : [],
+      })) : [],
+    }));
+}
+
+// syncItemsFromAccount 从账号同步商品。
+export const syncItemsFromAccount = async (cookieId: string): Promise<ItemSyncResponse> => {
+    return post('/api/v1/items/get-all-from-account', { cookie_id: cookieId });
+}
+
+// deleteItem 删除商品。
+export const deleteItem = async (cookieId: string, itemId: string): Promise<OperationResponse> => {
+    return del(`/api/v1/items/${cookieId}/${itemId}`);
+}
+
+// createItem 创建商品。
+export const createItem = async (cookieId: string, data: Partial<Item>): Promise<OperationResponse> => {
+    return post(`/api/v1/items/${cookieId}`, data);
+}
+
+// publishItem 发布商品。
+export const publishItem = async (form: {
+    /** cookie_id 表示登录凭证标识。 */ cookie_id: string;
+    /** title 表示标题。 */ title: string;
+    /** description 表示描述。 */ description: string;
+    /** price 表示售价。 */ price: string;
+    /** original_price 表示原始售价。 */ original_price?: string;
+    /** quantity 表示待发布商品的件数，提交前会转换为表单字符串。 */ quantity: string | number;
+    /** postage_mode 表示运费模式。 */ postage_mode: string;
+    /** postage 表示运费。 */ postage?: string;
+    /** images 表示图片列表。 */ images: File[];
+	/** location 表示地址。 */ location?: PublishLocation;
+}): Promise<ItemPublishResponse> => {
+    // body 请求体，用于当前 API 处理流程。
+    const body = new FormData();
+    body.set('cookie_id', form.cookie_id);
+    body.set('title', form.title);
+    body.set('description', form.description);
+    body.set('price', form.price);
+    body.set('original_price', form.original_price || '');
+    body.set('quantity', String(form.quantity));
+    body.set('postage_mode', form.postage_mode);
+    body.set('postage', form.postage || '');
+	if (form.location) body.set('location', JSON.stringify(form.location));
+    for (const // file 上传文件，用于当前 API 处理流程。
+file of form.images) {
+      body.append('images', file);
+    }
+    return postForm('/api/v1/items/publish', body);
+}
+
+// recommendPublishCategory 推荐商品发布分类。
+export const recommendPublishCategory = async (cookieId: string, keyword: string, options?: RequestControlOptions): Promise<CategoryRecommendationResponse> => {
+    // 类目推荐成功响应使用共享 CategoryRecommendationResponse。
+    // category 字段保留平台类目 ID、名称和频道类目 ID。
+    // tb_cat_id 继续保持可选，兼容电子资料类目。
+    // 请求仍携带账号 ID 和关键词。
+    // 失败响应由共享 HTTP 错误结构处理。
+    // 该类型收口不改变凭证刷新和错误处理。
+    // 前端批量发布流程可直接复用 category。
+    // 旧路径继续由现有 Vite 代理转发。
+	return post('/api/v1/items/publish-categories/recommend', { cookie_id: cookieId, keyword }, options);
+};
+
+// previewItemPublishBatch 预览商品批量发布。
+export const previewItemPublishBatch = async (form: {
+    /** file 表示上传文件。 */ file: File;
+    /** imagesZip 表示图片压缩包。 */ imagesZip?: File | null;
+    /** defaultCookieId 表示默认账号凭证标识。 */ defaultCookieId?: string;
+    /** fallbackCategory 表示备用分类。 */ fallbackCategory: {
+      /** catId 表示分类标识。 */ catId: string;
+      /** catName 表示分类名称。 */ catName: string;
+      /** channelCatId 表示渠道分类标识。 */ channelCatId?: string;
+      /** tbCatId 表示淘宝分类标识。 */ tbCatId?: string;
+    };
+	/** location 表示地址。 */ location?: PublishLocation;
+	/** publishIntervalSeconds 表示最终商品发布之间的最小间隔秒数。 */
+	publishIntervalSeconds?: number;
+}, options?: RequestControlOptions): Promise<ItemPublishBatchPreviewResponse> => {
+    // body 请求体，用于当前 API 处理流程。
+    const body = new FormData();
+    body.set('file', form.file);
+    if (form.imagesZip) body.set('images_zip', form.imagesZip);
+    if (form.defaultCookieId) body.set('default_cookie_id', form.defaultCookieId);
+    body.set('fallback_category_id', form.fallbackCategory.catId);
+    body.set('fallback_category_name', form.fallbackCategory.catName);
+    body.set('fallback_channel_category_id', form.fallbackCategory.channelCatId || '');
+    body.set('fallback_tb_category_id', form.fallbackCategory.tbCatId || '');
+	if (form.location) body.set('location', JSON.stringify(form.location));
+	body.set('publish_interval_seconds', String(form.publishIntervalSeconds ?? 5));
+	return postForm('/api/v1/items/publish-batches/preview', body, options);
+}
+
+// startItemPublishBatch 启动商品批量发布。
+export const startItemPublishBatch = async (previewId: string, options?: RequestControlOptions): Promise<BatchIDResponse> => {
+	return post('/api/v1/items/publish-batches', { preview_id: previewId }, options);
+}
+
+// getItemPublishBatch 读取商品发布批次。
+export const getItemPublishBatch = async (batchId: string, options?: RequestControlOptions): Promise<ItemPublishBatchResponse> => {
+	return get(`/api/v1/items/publish-batches/${batchId}`, undefined, options);
+}
+
+// getItemPublishBatches 读取商品发布批次列表。
+export const getItemPublishBatches = async (limit = 20, options?: RequestControlOptions): Promise<ItemPublishBatchResponse[]> => {
+    // res 接口响应结果，用于当前 API 处理流程。
+	const res = await get<unknown>('/api/v1/items/publish-batches', { limit }, options);
+    return collectionFrom<ItemPublishBatchResponse>(res, ['batches', 'data', 'items']);
+}
+
+// deleteItemPublishBatch 删除商品发布批次。
+export const deleteItemPublishBatch = async (batchId: string, options?: RequestControlOptions): Promise<OperationResponse> => {
+	return del(`/api/v1/items/publish-batches/${batchId}`, undefined, options);
+}
+
+// cancelItemPublishBatch 取消商品发布批次。
+export const cancelItemPublishBatch = async (batchId: string, options?: RequestControlOptions): Promise<BatchCancelResponse> => {
+	return post(`/api/v1/items/publish-batches/${batchId}/cancel`, {}, options);
+}
+
+// retryFailedItemPublishBatch 重试失败的商品发布任务。
+export const retryFailedItemPublishBatch = async (batchId: string, options?: RequestControlOptions): Promise<BatchIDResponse> => {
+	return post(`/api/v1/items/publish-batches/${batchId}/retry-failed`, {}, options);
+}
+
+// updateItem 更新商品。
+export const updateItem = async (cookieId: string, itemId: string, data: Partial<Item>): Promise<OperationResponse> => {
+    return put(`/api/v1/items/${cookieId}/${itemId}`, data);
+}
+
+// updateItemSKUCost 仅更新 ERP 本地单件成本；null 表示清除，不调用闲鱼商品编辑接口。
+export const updateItemSKUCost = async (cookieId: string, itemId: string, skuId: string, costCents: number | null, options?: RequestControlOptions): Promise<OperationResponse> => {
+    return put(`/api/v1/items/${cookieId}/${itemId}/skus/${skuId}/cost`, { cost_cents: costCents }, options);
+}
+
+// updateItemSKUCosts 在一个本地事务中保存商品全部成本，不调用闲鱼平台。
+export const updateItemSKUCosts = async (cookieId: string, itemId: string, costs: Array<{ /** sku_id 是平台或本地隐式 SKU 标识。 */ sku_id: string; /** cost_cents 是可空单件成本分值。 */ cost_cents: number | null }>, options?: RequestControlOptions): Promise<OperationResponse> => {
+    return put(`/api/v1/items/${cookieId}/${itemId}/sku-costs`, { costs }, options);
+}
+
+/** 读取指定账号与商品的详情，用于编辑器恢复表单。 */
+export const getItemDetail = async (accountID: string, itemID: string): Promise<ItemDetailResponse> => get(`/api/v1/items/${accountID}/${itemID}`);
