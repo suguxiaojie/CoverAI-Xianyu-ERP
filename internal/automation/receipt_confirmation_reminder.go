@@ -49,7 +49,7 @@ func (c *accountTaskCoordinator) scanReceiptConfirmationReminders(ctx context.Co
 			if runErr != nil {
 				return runErr
 			}
-			if exists && !(existing.Status == "failed" && existing.NextRetryAt > 0 && existing.NextRetryAt <= now.UTC().Unix()) {
+			if exists && (existing.Status != "failed" || existing.NextRetryAt <= 0 || existing.NextRetryAt > now.UTC().Unix()) {
 				continue
 			}
 			// latest、latestErr 在抢占运行前重新确认订单仍为已发货并读取最新唯一聊天目标。
@@ -108,12 +108,11 @@ func (c *accountTaskCoordinator) scanReceiptConfirmationReminders(ctx context.Co
 				}
 				return c.finishAccountTaskRun(ctx, runKey, "cancelled", 0, 1, message, 0)
 			}
-			// updatedCookies、persistErr 是官方接口成功后响应 Cookie 的安全持久化结果。
-			updatedCookies, persistErr := c.persistTaskCookies(ctx, settings.CookieID, currentCookies, result.UpdatedCookies)
+			// persistErr 是官方接口成功后响应 Cookie 的安全持久化错误。
+			_, persistErr := c.persistTaskCookies(ctx, settings.CookieID, currentCookies, result.UpdatedCookies)
 			if persistErr != nil {
 				return c.quarantineAccountTaskRun(ctx, runKey, 1, 0, persistErr)
 			}
-			currentCookies = updatedCookies
 			// finishErr 保存明确发送完成的成功状态；保存失败时 helper 会立即隔离，避免下一轮重复发送。
 			finishErr := c.finishAccountTaskRun(ctx, runKey, "success", 1, 0, "", 0)
 			if finishErr != nil {

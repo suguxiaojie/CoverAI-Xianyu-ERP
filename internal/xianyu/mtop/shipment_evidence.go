@@ -23,9 +23,7 @@ type ShipmentEvidenceUpload struct {
 // UploadShipmentEvidenceImage 使用官方 fleamarket 作用域上传一张发货凭证。
 func (c *ClientImpl) UploadShipmentEvidenceImage(ctx context.Context, cookiesStr string, image ShipmentEvidenceImage) (*ShipmentEvidenceUpload, error) {
 	// uploaded、updatedCookies、uploadErr 是通用上传器返回的图片和凭证变化。
-	uploaded, updatedCookies, uploadErr := c.uploadScopedImage(ctx, cookiesStr, PublishImage{
-		Filename: image.Filename, ContentType: image.ContentType, Data: image.Data,
-	}, "fleamarket", "发货凭证")
+	uploaded, updatedCookies, uploadErr := c.uploadScopedImage(ctx, cookiesStr, PublishImage(image), "fleamarket", "发货凭证")
 	if uploadErr != nil {
 		return nil, uploadErr
 	}

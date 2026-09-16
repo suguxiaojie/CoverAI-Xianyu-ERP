@@ -168,7 +168,9 @@ func (server *Server) refuseMerchantRefund(writer http.ResponseWriter, request *
 	// input、images、decodeErr 是用户二次确认的字段、内存图片和解析错误。
 	input, images, decodeErr := decodeMerchantRefundRefuseRequest(writer, request)
 	if request.MultipartForm != nil {
-		defer request.MultipartForm.RemoveAll()
+		defer func() { // multipartCleanup 尽力删除 HTTP 解析器生成的临时文件，不覆盖主业务结果。
+			_ = request.MultipartForm.RemoveAll()
+		}()
 	}
 	if orderID == "" || decodeErr != nil || strings.TrimSpace(input.AccountID) == "" || strings.TrimSpace(input.ReasonID) == "" {
 		writeErr(writer, http.StatusBadRequest, "拒绝退款请求无效")

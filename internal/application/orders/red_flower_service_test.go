@@ -19,8 +19,6 @@ type redFlowerRepositoryFake struct {
 	details []*PlatformRuntimeData
 	// detailIndex 是下一次凭证读取位置。
 	detailIndex int
-	// platformCallsBeforeFinish 不参与生产逻辑，仅由测试运行时写入以验证顺序。
-	platformCallsBeforeFinish int
 	// finishStatus 保存最后写入的运行终态。
 	finishStatus string
 	// finishMessage 保存最后写入的非敏感说明。

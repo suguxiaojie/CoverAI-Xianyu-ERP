@@ -214,7 +214,7 @@ func captchaModeShowBrowser(mode CaptchaMode) (showBrowser, provided bool, err e
 	case CaptchaModeManual:
 		return true, true, nil
 	default:
-		return false, true, errors.New("Token 滑块处理方式无效")
+		return false, true, errors.New("滑块处理方式无效")
 	}
 }
 

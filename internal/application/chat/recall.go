@@ -91,9 +91,10 @@ func (s *Service) Recall(ctx context.Context, input RecallInput) (*Message, erro
 	}
 	// contentType 是官方撤回 Feature 使用的原内容类型。
 	contentType := 1
-	if message.MessageType == "image" {
+	switch message.MessageType {
+	case "image":
 		contentType = 2
-	} else if message.MessageType == "location" {
+	case "location":
 		contentType = 30
 	}
 	// recallErr 保存平台明确失败或结果不确定错误。

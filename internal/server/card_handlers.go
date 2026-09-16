@@ -263,7 +263,9 @@ func decodeCardMutation(w http.ResponseWriter, r *http.Request) (cardsapp.Draft,
 		return cardsapp.Draft{}, nil, fmt.Errorf("图片不能为空且不能超过 10 MiB")
 	}
 	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
+		defer func() { // multipartCleanup 尽力删除 HTTP 解析器生成的临时文件，不覆盖主业务结果。
+			_ = r.MultipartForm.RemoveAll()
+		}()
 	}
 	// request 是 payload 字段中的具名卡券请求 DTO。
 	var request cardMutationRequest
