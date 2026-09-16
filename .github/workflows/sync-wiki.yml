@@ -24,14 +24,26 @@ jobs:
           ref: main
 
       - name: 克隆 GitHub Wiki 仓库
+        id: wiki
         env:
           WIKI_REPOSITORY: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.wiki.git
-        run: git clone "$WIKI_REPOSITORY" wiki
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if ! git ls-remote "$WIKI_REPOSITORY" >/dev/null 2>&1; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "GitHub Wiki 尚未初始化，跳过本次同步。"
+            exit 0
+          fi
+          git clone "$WIKI_REPOSITORY" wiki
+          echo "available=true" >> "$GITHUB_OUTPUT"
 
       - name: 镜像 Wiki 页面
+        if: steps.wiki.outputs.available == 'true'
         run: rsync -a --delete --exclude='.git' docs/wiki/ wiki/
 
       - name: 提交并推送 Wiki
+        if: steps.wiki.outputs.available == 'true'
         working-directory: wiki
         env:
           GIT_AUTHOR_NAME: github-actions[bot]
