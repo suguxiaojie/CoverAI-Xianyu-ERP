@@ -10,7 +10,7 @@
 
 六个正式架构重构阶段已完成，全部既有架构门禁持续启用。当前快照包含多账号、聊天、订单、商品、卡密、自动化、经营分析、通知、桌面打包与三数据库方言实现。
 
-验收记录同步至：`2026-09-16 首次脱敏开源快照`。
+验收记录同步至：`2026-09-16 开源质量门禁收口`。
 
 ## 已完成
 
@@ -18,6 +18,7 @@
 - Go／React 管理后台、SQLite／MySQL／PostgreSQL 迁移和 Playwright 浏览器运行时。
 - Windows、macOS、Linux 打包脚本与 Docker 多架构工作流。
 - 首次开源快照的 README、许可证核对、历史隔离与业务标识脱敏。
+- 公开 CI 的 Go、React、race 和 SQLite／MySQL／PostgreSQL 三方言门禁。
 
 ## 进行中
 
@@ -40,6 +41,9 @@
 
 ## 最近验证
 
+- 2026-09-16 14:14：公开 Actions 运行 `35062582537` 通过 Go 全门禁、server race、前端 `574/574` 用例和 SQLite／MySQL 8.4／PostgreSQL 17 三方言实测。
+- 2026-09-16 14:10：MySQL Schema 50 复合主键宽度已修复，新库迁移在 MySQL 8.4 实测通过。
+- 2026-09-16 14:02：`golangci-lint v2.12.2` 为 `0 issues`，嵌入前端已按 `npm ci` 锁文件重建并通过 CI 一致性检查。
 - 2026-09-16 13:43：前端 `90/90` 个测试文件、`574/574` 个用例通过，TypeScript 和 Vite `2403` 模块生产构建通过。
 - 2026-09-16 13:42：`go test ./... -count=1`、`go vet ./...`、`go build ./cmd/server`通过。
 - 2026-09-16 13:40：`make architecture`、Go／前端中文注释检查、`make roadmap` 和 `git diff --check`通过。
