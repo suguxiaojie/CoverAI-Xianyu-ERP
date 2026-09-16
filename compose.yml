@@ -34,7 +34,7 @@ services:
       start_period: 10s
 
   app:
-    image: ${XIANYU_IMAGE:-ghcr.io/suguxiaojie/coverai-xianyu-erp:latest}
+    image: ${XIANYU_IMAGE:-ghcr.io/suguxiaojie/coverai-xianyu-erp:main}
     pull_policy: always
     restart: unless-stopped
     depends_on:
