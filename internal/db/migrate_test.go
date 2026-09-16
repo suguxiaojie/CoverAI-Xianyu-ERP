@@ -4,11 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/pressly/goose/v3"
 )
+
+// TestMySQLKeywordEventReplyPrimaryKeyFitsInnoDBLimit 验证 utf8mb4 复合主键不会超过 InnoDB 3072 字节索引上限。
+func TestMySQLKeywordEventReplyPrimaryKeyFitsInnoDBLimit(t *testing.T) {
+	// migration 是 Schema 50 的 MySQL 建表语句，不连接外部数据库也能锁定关键字段宽度。
+	migration, readErr := migrationsFS.ReadFile("migrations/mysql/00050_keyword_event_reply_idempotency.sql")
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	// migrationText 用于逐字段核对三个 utf8mb4 主键标识的受限长度。
+	migrationText := string(migration)
+	// primaryKeyColumns 是复合主键中需要限制为 191 字符的业务标识列。
+	primaryKeyColumns := []string{"cookie_id", "order_id", "group_id"}
+	for _, column := range primaryKeyColumns { // column 是当前待核对的 Schema 50 主键列名。
+		if !strings.Contains(migrationText, column+" VARCHAR(191) NOT NULL") {
+			t.Fatalf("MySQL Schema 50 主键列 %s 未限制为 VARCHAR(191)", column)
+		}
+	}
+}
 
 // TestMigrate_AppliesCleanSchema 在临时库上跑迁移，验证全量 schema 干净落地、
 // 关键不一致列（orders.system_shipped 等）存在、默认设置就位。

@@ -1,9 +1,10 @@
 -- +goose Up
 -- 系统关键词订单事件幂等：卖家实时卡片与后续买家通知只能成功发送一次。
 CREATE TABLE keyword_event_reply_records (
-    cookie_id VARCHAR(255) NOT NULL,
-    order_id VARCHAR(255) NOT NULL,
-    group_id VARCHAR(255) NOT NULL,
+    -- 三个业务标识参与 utf8mb4 复合主键；191 字符保证最坏索引宽度低于 InnoDB 3072 字节上限。
+    cookie_id VARCHAR(191) NOT NULL,
+    order_id VARCHAR(191) NOT NULL,
+    group_id VARCHAR(191) NOT NULL,
     event_type VARCHAR(64) NOT NULL,
     status VARCHAR(32) NOT NULL DEFAULT 'pending',
     claim_token VARCHAR(255) NOT NULL DEFAULT '',
